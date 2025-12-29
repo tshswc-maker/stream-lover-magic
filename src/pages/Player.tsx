@@ -1,14 +1,43 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
-import { ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Loader2, AlertCircle, RefreshCw } from "lucide-react";
+import { ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Loader2, AlertCircle, RefreshCw, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-// CORS proxy list - will try them in order
+// Custom loader that proxies all requests through CORS proxy
+const createProxiedLoader = (proxyUrl: string) => {
+  return class ProxiedLoader extends Hls.DefaultConfig.loader {
+    load(context: any, config: any, callbacks: any) {
+      // Proxy all URLs (manifest and segments)
+      const originalUrl = context.url;
+      
+      // Only proxy if URL is http (not https or already proxied)
+      if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
+        context.url = `${proxyUrl}${encodeURIComponent(originalUrl)}`;
+      }
+      
+      super.load(context, config, callbacks);
+    }
+  };
+};
+
+// CORS proxy configurations - using ones that support streaming
 const CORS_PROXIES = [
-  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://proxy.cors.sh/${url}`,
+  {
+    name: "corsproxy.io",
+    getUrl: (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    createLoader: () => createProxiedLoader("https://corsproxy.io/?"),
+  },
+  {
+    name: "allorigins",
+    getUrl: (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    createLoader: () => createProxiedLoader("https://api.allorigins.win/raw?url="),
+  },
+  {
+    name: "cors-anywhere (demo)",
+    getUrl: (url: string) => `https://cors-anywhere.herokuapp.com/${url}`,
+    createLoader: () => createProxiedLoader("https://cors-anywhere.herokuapp.com/"),
+  },
 ];
 
 const Player = () => {
@@ -24,19 +53,12 @@ const Player = () => {
   const [error, setError] = useState<string | null>(null);
   const [showControls, setShowControls] = useState(true);
   const [currentProxyIndex, setCurrentProxyIndex] = useState(0);
-  const [retryCount, setRetryCount] = useState(0);
+  const [showExternalOption, setShowExternalOption] = useState(false);
 
   const streamUrl = searchParams.get("url") || "";
   const title = searchParams.get("title") || "Stream";
 
-  const getProxiedUrl = (url: string, proxyIndex: number): string => {
-    if (proxyIndex >= CORS_PROXIES.length) {
-      return url; // Try direct as last resort
-    }
-    return CORS_PROXIES[proxyIndex](url);
-  };
-
-  const loadStream = (proxyIndex: number) => {
+  const loadStream = useCallback((proxyIndex: number) => {
     const video = videoRef.current;
     if (!video || !streamUrl) return;
 
@@ -48,30 +70,44 @@ const Player = () => {
 
     setIsLoading(true);
     setError(null);
+    setShowExternalOption(false);
 
-    const proxiedUrl = getProxiedUrl(streamUrl, proxyIndex);
-    console.log(`Trying proxy ${proxyIndex}:`, proxiedUrl);
+    const proxy = CORS_PROXIES[proxyIndex];
+    if (!proxy) {
+      // All proxies failed
+      setError("Impossible de charger le flux via les proxys CORS.");
+      setShowExternalOption(true);
+      setIsLoading(false);
+      return;
+    }
+
+    console.log(`Trying proxy ${proxyIndex + 1}/${CORS_PROXIES.length}: ${proxy.name}`);
 
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
+        // Use custom loader that proxies ALL requests (manifest + segments)
+        loader: proxy.createLoader(),
         xhrSetup: (xhr) => {
           xhr.withCredentials = false;
         },
-        manifestLoadingMaxRetry: 2,
-        manifestLoadingRetryDelay: 1000,
+        manifestLoadingMaxRetry: 1,
+        manifestLoadingRetryDelay: 500,
+        manifestLoadingTimeOut: 15000,
         levelLoadingMaxRetry: 2,
         fragLoadingMaxRetry: 2,
       });
 
       hlsRef.current = hls;
 
+      // Load with proxied URL for initial manifest
+      const proxiedUrl = proxy.getUrl(streamUrl);
       hls.loadSource(proxiedUrl);
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        console.log("Stream loaded successfully");
+        console.log("Stream loaded successfully via", proxy.name);
         setIsLoading(false);
         setError(null);
         video.play().catch(console.error);
@@ -83,37 +119,38 @@ const Player = () => {
           hls.destroy();
           
           // Try next proxy
-          if (proxyIndex < CORS_PROXIES.length) {
-            console.log(`Proxy ${proxyIndex} failed, trying next...`);
-            setCurrentProxyIndex(proxyIndex + 1);
-            loadStream(proxyIndex + 1);
+          const nextIndex = proxyIndex + 1;
+          if (nextIndex < CORS_PROXIES.length) {
+            console.log(`Proxy ${proxy.name} failed, trying next...`);
+            setCurrentProxyIndex(nextIndex);
+            loadStream(nextIndex);
           } else {
-            setError("Impossible de charger le flux. Tous les proxys ont échoué.");
+            setError("Impossible de charger le flux. Le serveur de stream peut être hors ligne ou bloque les connexions.");
+            setShowExternalOption(true);
             setIsLoading(false);
           }
         }
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      // Native HLS support (Safari)
-      video.src = proxiedUrl;
+      // Native HLS support (Safari) - try direct first
+      video.src = streamUrl;
+      
+      const handleError = () => {
+        setError("Erreur de lecture du flux");
+        setShowExternalOption(true);
+        setIsLoading(false);
+      };
+      
       video.addEventListener("loadedmetadata", () => {
         setIsLoading(false);
         video.play().catch(console.error);
       });
-      video.addEventListener("error", () => {
-        if (proxyIndex < CORS_PROXIES.length) {
-          setCurrentProxyIndex(proxyIndex + 1);
-          loadStream(proxyIndex + 1);
-        } else {
-          setError("Erreur de lecture du flux");
-          setIsLoading(false);
-        }
-      });
+      video.addEventListener("error", handleError);
     } else {
       setError("Votre navigateur ne supporte pas la lecture HLS");
       setIsLoading(false);
     }
-  };
+  }, [streamUrl]);
 
   useEffect(() => {
     loadStream(0);
@@ -123,12 +160,21 @@ const Player = () => {
         hlsRef.current.destroy();
       }
     };
-  }, [streamUrl]);
+  }, [loadStream]);
 
   const handleRetry = () => {
-    setRetryCount(prev => prev + 1);
     setCurrentProxyIndex(0);
     loadStream(0);
+  };
+
+  const openInExternalPlayer = () => {
+    // Copy stream URL to clipboard and show instructions
+    navigator.clipboard.writeText(streamUrl).then(() => {
+      alert("URL copiée ! Collez-la dans VLC ou un autre lecteur compatible.");
+    }).catch(() => {
+      // Fallback: open in new tab
+      window.open(streamUrl, '_blank');
+    });
   };
 
   const togglePlay = () => {
@@ -221,7 +267,9 @@ const Player = () => {
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 z-10">
             <Loader2 className="w-12 h-12 text-primary animate-spin mb-4" />
             <p className="text-muted-foreground text-sm">
-              {currentProxyIndex > 0 ? `Tentative ${currentProxyIndex + 1}/${CORS_PROXIES.length + 1}...` : 'Chargement du flux...'}
+              {currentProxyIndex > 0 
+                ? `Tentative ${currentProxyIndex + 1}/${CORS_PROXIES.length} (${CORS_PROXIES[currentProxyIndex]?.name})...` 
+                : 'Chargement du flux...'}
             </p>
           </div>
         )}
@@ -230,18 +278,33 @@ const Player = () => {
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/90 z-10 p-4">
             <AlertCircle className="w-16 h-16 text-destructive mb-4" />
             <p className="text-foreground text-center text-lg mb-2">{error}</p>
-            <p className="text-muted-foreground text-center text-sm mb-4 max-w-md break-all">
+            <p className="text-muted-foreground text-center text-xs mb-4 max-w-md break-all">
               URL: {streamUrl}
             </p>
-            <div className="flex gap-3">
+            
+            <div className="flex flex-wrap gap-3 justify-center">
               <Button onClick={handleRetry} variant="outline" className="gap-2">
                 <RefreshCw className="w-4 h-4" />
                 Réessayer
               </Button>
+              
+              {showExternalOption && (
+                <Button onClick={openInExternalPlayer} variant="outline" className="gap-2">
+                  <ExternalLink className="w-4 h-4" />
+                  Copier pour VLC
+                </Button>
+              )}
+              
               <Button onClick={() => navigate(-1)} variant="outline">
                 Retour
               </Button>
             </div>
+
+            {showExternalOption && (
+              <p className="text-muted-foreground text-center text-xs mt-4 max-w-md">
+                Conseil : Ouvrez ce lien dans VLC Media Player ou un autre lecteur compatible m3u8 pour contourner les restrictions CORS.
+              </p>
+            )}
           </div>
         )}
 
