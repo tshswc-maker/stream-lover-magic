@@ -3,7 +3,7 @@ import { useSearchParams, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
 import { ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Loader2, AlertCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-
+import LiveChat from "@/components/LiveChat";
 // CORS proxy list - will try them in order
 const CORS_PROXIES = [
   (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
@@ -286,6 +286,9 @@ const Player = () => {
           </div>
         </div>
       </div>
+
+      {/* Live Chat */}
+      <LiveChat />
     </div>
   );
 };
